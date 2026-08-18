@@ -6,6 +6,7 @@ import { DataSource, Repository } from 'typeorm';
 import { ThrottlerStorage, ThrottlerStorageService } from '@nestjs/throttler';
 import { AppModule } from '../src/app.module';
 import { AuthService } from '../src/auth/auth.service';
+import { MailService } from '../src/mail/mail.service';
 import { DomainExceptionFilter } from '../src/common/filters/domain-exception.filter';
 import { ValidationExceptionFilter } from '../src/common/filters/validation-exception.filter';
 import { Channel } from '../src/channels/entities/channel.entity';
@@ -13,6 +14,19 @@ import { Video } from '../src/videos/entities/video.entity';
 import { cleanAllTables } from '../src/test/create-test-data-source';
 
 const TEN_GB = 10 * 1024 ** 3;
+
+interface UploadSessionResponseBody {
+  error?: string;
+  access_token?: string;
+  videoId?: string;
+  uploadUrl?: string;
+  expiresAt?: string;
+  storageKey?: string;
+}
+
+function body(res: request.Response): UploadSessionResponseBody {
+  return res.body as UploadSessionResponseBody;
+}
 
 describe('POST /videos/upload-session (e2e)', () => {
   let app: INestApplication<App>;
@@ -61,12 +75,15 @@ describe('POST /videos/upload-session (e2e)', () => {
     password = 'password123',
   ): Promise<string> {
     const authService = app.get(AuthService);
-    const mailServiceInstance = (authService as any).mailService;
+    const mailServiceInstance = (
+      authService as unknown as { mailService: MailService }
+    ).mailService;
     let capturedToken = '';
     jest
       .spyOn(mailServiceInstance, 'sendConfirmationEmail')
-      .mockImplementationOnce(async (_e: string, _n: string, t: string) => {
+      .mockImplementationOnce((_e: string, _n: string, t: string) => {
         capturedToken = t;
+        return Promise.resolve();
       });
     await request(app.getHttpServer())
       .post('/auth/register')
@@ -85,7 +102,7 @@ describe('POST /videos/upload-session (e2e)', () => {
     const res = await request(app.getHttpServer())
       .post('/auth/login')
       .send({ email, password });
-    return res.body.access_token;
+    return body(res).access_token!;
   }
 
   it('create-upload-session-success: returns 201 with videoId/uploadUrl/expiresAt/storageKey and persists a draft Video row', async () => {
@@ -103,17 +120,17 @@ describe('POST /videos/upload-session (e2e)', () => {
       })
       .expect(201);
 
-    expect(res.body.videoId).toBeDefined();
-    expect(res.body.uploadUrl).toBeDefined();
-    expect(res.body.expiresAt).toBeDefined();
-    expect(res.body.storageKey).toBeDefined();
+    expect(body(res).videoId).toBeDefined();
+    expect(body(res).uploadUrl).toBeDefined();
+    expect(body(res).expiresAt).toBeDefined();
+    expect(body(res).storageKey).toBeDefined();
 
     const channel = await channelRepository.findOneBy({});
-    expect(res.body.storageKey).toBe(
-      `channels/${channel?.id}/videos/${res.body.videoId}.mp4`,
+    expect(body(res).storageKey).toBe(
+      `channels/${channel?.id}/videos/${body(res).videoId}.mp4`,
     );
 
-    const video = await videoRepository.findOneBy({ id: res.body.videoId });
+    const video = await videoRepository.findOneBy({ id: body(res).videoId! });
     expect(video).not.toBeNull();
     expect(video?.status).toBe('draft');
   });
@@ -133,7 +150,7 @@ describe('POST /videos/upload-session (e2e)', () => {
       })
       .expect(400);
 
-    expect(res.body.error).toBe('FILE_TOO_LARGE');
+    expect(body(res).error).toBe('FILE_TOO_LARGE');
 
     const videoCount = await videoRepository.count();
     expect(videoCount).toBe(0);
@@ -154,7 +171,7 @@ describe('POST /videos/upload-session (e2e)', () => {
       })
       .expect(400);
 
-    expect(res.body.error).toBe('UNSUPPORTED_CONTENT_TYPE');
+    expect(body(res).error).toBe('UNSUPPORTED_CONTENT_TYPE');
   });
 
   it('unauthenticated-request-rejected: returns 401 without an Authorization header', async () => {

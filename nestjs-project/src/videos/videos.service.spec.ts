@@ -30,7 +30,7 @@ describe('VideosService — createUploadSession', () => {
         {
           provide: getRepositoryToken(Video),
           useValue: {
-            create: jest.fn((data) => data),
+            create: jest.fn((data: Partial<Video>) => data),
             save: jest.fn().mockResolvedValue({}),
             findOneBy: jest.fn(),
           },
