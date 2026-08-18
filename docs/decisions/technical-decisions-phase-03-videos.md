@@ -1,9 +1,9 @@
 ---
 scope_type: phase
 related_phases: [3]
-status: pending
+status: decided
 date: 2026-07-31
-scope_description: "Backend foundation for video upload, storage, and asynchronous processing: queue technology, upload strategy for 10GB files, video worker infrastructure, streaming protocol, URL generation, video status lifecycle, and storage organization."
+scope_description: "Backend foundation for video upload, storage, and asynchronous processing: queue technology, upload strategy for 10GB files, video worker infrastructure, streaming protocol, URL generation, video status lifecycle, storage organization, and FFmpeg/FFprobe invocation mechanism."
 ---
 
 # Technical Decisions — Fase 03: Upload e Processamento de Vídeos
@@ -48,7 +48,9 @@ _Subprojects in scope:_
 
 **Recommendation:** **Option A (Redis + Bull)** — For an MVP and greenfield project, Redis + Bull offers the optimal balance of simplicity, testability, and scalability. The project already uses PostgreSQL in Docker, so adding a Redis container is a negligible operational step. Bull's NestJS integration (@nestjs/bull) is mature and well-documented. Job processing in Fase 03 is not at scale that requires RabbitMQ's advanced features. If job volume grows to millions per day (Fase 04+), migration to RabbitMQ is straightforward — Bull's API translates cleanly to RabbitMQ via @golevelup. AWS SQS breaks the local Docker workflow and adds unnecessary complexity and cost for development.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (Redis + Bull)** — accepted as recommended. `@nestjs/bull` registers the `video-processing` queue; Redis runs as a Docker Compose service (`redis:7-alpine`). No divergence from the research recommendation.
+
+**Libraries:** @nestjs/bull@^11.x, bull@^5.x
 
 ---
 
@@ -82,7 +84,15 @@ _Subprojects in scope:_
 
 **Recommendation:** **Option A (Presigned URL)** — Presigned URL is the industry standard for large-file uploads (AWS, Google Cloud, Figma, Dropbox). It eliminates API resource consumption entirely, making it infinitely scalable. MinIO SDK supports presigned URL generation natively. The callback/polling complexity is minimal — a simple polling loop or S3-event-based trigger suffices for MVP. The ~2-hour TTL is generous for typical user uploads. If network interruption is a concern (flaky mobile networks), Add resumable-upload support (TUS protocol) in a future phase; presigned URL can integrate with TUS clients.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (Presigned URL)**, with upload-completion detection resolved as follows: **MinIO bucket notifications published to Redis**. MinIO is configured (`MINIO_NOTIFY_REDIS_*`) to publish the `s3:ObjectCreated:Put` event for the video object directly to a Redis channel/list — MinIO's native Redis notification target. The backend (already connected to Redis for TD-01/Bull) subscribes to that channel and, on receipt, enqueues the `process-video` job on the `video-processing` Bull queue, transitioning the video from `draft` to `processing`.
+
+This was chosen over the other two candidates:
+- **Client-driven confirmation** (`POST /videos/:id/confirm-upload`) — rejected because it trusts the client to report completion; a server-side existence check against MinIO would still be needed to make it safe, which reintroduces the complexity it was meant to avoid.
+- **Backend cron polling MinIO** — rejected because it adds latency (bounded by poll interval) and a new scheduled job to build, test, and operate, with no reuse of existing infrastructure.
+
+The Redis-notification path adds no new infrastructure (Redis and MinIO are both already mandatory for this phase), is exercised by real services in Docker Compose rather than simulated, and keeps the completion signal authoritative (it comes from MinIO itself, not from the client).
+
+**Libraries:** — (uses MinIO's built-in notification config; no new npm dependency)
 
 ---
 
@@ -110,7 +120,9 @@ _Subprojects in scope:_
 
 **Recommendation:** **Option A (Dedicated Worker Container)** — Separate worker container is the standard production pattern and costs minimal extra setup in Docker Compose. It isolates concerns (API handles HTTP, worker handles batch processing), enables independent scaling, and prevents the classic "heavy job blocks user requests" antipattern. For MVP, a single worker replica is fine; scaling up is trivial later. The Dockerfile for the worker is simple (Node + FFmpeg from a public image like `node:22-alpine` with `apk add ffmpeg`). Using @nestjs/bull in the worker is the same as in the API — no learning curve added.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (Dedicated Worker Container)** — accepted as recommended. A `worker` service (`Dockerfile.worker`, Node + FFmpeg) consumes the `video-processing` queue independently of the API container; single replica for Phase 03, horizontally scalable later via `docker compose up -d --scale worker=N`.
+
+**Libraries:** — (FFmpeg is a native binary installed in the worker's Docker image, not an npm package; the worker reuses `@nestjs/bull` already listed in TD-01)
 
 ---
 
@@ -146,7 +158,9 @@ Three common approaches exist for video streaming on the web:
 
 **Recommendation:** **Option A (HTTP Range Requests)** — For MVP and phase 03, Range requests are the pragmatic choice. The implementation is trivial (NestJS `StreamableFile` + Content-Range header handling). Seeking works instantly (no manifest parsing). No transcoding = no infrastructure overhead. As video volume grows and mobile traffic increases (Fase 04+), HLS can be added as an upgrade; Range requests remain as a fallback for simple browsers. The project's stack (NestJS + MinIO) supports both patterns; they are not mutually exclusive.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (HTTP Range Requests)** — accepted as recommended. `GET /videos/:id/stream` reads the requested byte range from MinIO and responds with `206 Partial Content` + `Content-Range`; no transcoding pipeline in Phase 03. HLS/DASH remain a future upgrade, not a blocker for this phase.
+
+**Libraries:** — (native NestJS/Express stream handling + MinIO SDK's ranged `getObject`, no new package)
 
 ---
 
@@ -184,7 +198,9 @@ Three common approaches exist for video streaming on the web:
 
 **Recommendation:** **Option A (UUID v4)** — For MVP, UUID v4 is the pragmatic choice. PostgreSQL has native UUID type (efficient storage and indexing). No collision logic needed. Zero dependencies. Simplest implementation. URL length is a non-issue for technical APIs. Fase 04 (video editing) can add an optional **slug field** alongside UUID for SEO and UI purposes — both can coexist (UUID for technical routing, slug for human-readable URLs). This two-tier approach gives flexibility without MVP complexity.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (UUID v4)** — accepted as recommended. `id` is a native PostgreSQL `UUID` column (`DEFAULT gen_random_uuid()`), used directly in routes (`/videos/:id/stream`). No slug field in Phase 03; can be added in Phase 04 alongside the UUID without a breaking change.
+
+**Libraries:** — (PostgreSQL native `UUID` type + `gen_random_uuid()`, no new package)
 
 ---
 
@@ -227,7 +243,9 @@ Three common approaches exist for video streaming on the web:
 
 **Recommendation:** **Option A (Simple 4-State Machine)** — For MVP, the 4-state model is sufficient. It covers the happy path (draft → processing → ready) and the error case clearly. Automatic retry can be added in Fase 04 when video processing volume justifies it or if transient failures become a problem. The 4-state model is proven by YouTube, Vimeo, and other platforms and remains their go-to for years. Add `processing_attempts` and `last_error` columns now (they cost nothing but enable future retry logic); leave retry scheduling for later.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (Simple 4-State Machine)** — accepted as recommended, with the retry gap closed explicitly: **no automatic and no manual retry endpoint ships in Phase 03**. `error` is a terminal state for this phase — the only path back to `processing` is a new upload session (a new video record), not a retry of the failed one. `processing_attempts` and `last_error` columns are created now (populated by the worker) so Phase 04+ can add retry logic without a schema migration, but no `/videos/:id/retry` route or scheduled retry job exists yet. This was left ambiguous in the original TD ("manual user action or admin action") and is resolved here to keep Phase 03 scope closed.
+
+**Libraries:** — (schema columns only, no new package)
 
 ---
 
@@ -283,7 +301,42 @@ Three common approaches exist for video streaming on the web:
 
 **Recommendation:** **Option A (Hierarchical by Channel)** — Hierarchical organization scales well and supports future quota enforcement per channel (important for a multi-user platform). It's only marginally more complex than flat. The key paths (`channels/{channel_id}/videos/{video_id}.mp4`) remain clean and readable. This structure is used by major platforms (YouTube's GCS structure follows similar principles). If per-bucket separation of concerns becomes necessary (Fase 04+), buckets can be added without changing this path structure.
 
-**Decision:** _[pending]_
+**Decision:** **Option A (Hierarchical by Channel)** — accepted as recommended. Keys follow `channels/{channelId}/videos/{videoId}.mp4` and `channels/{channelId}/thumbnails/{videoId}.jpg` in a single bucket (`streamtube-videos`). Supports future per-channel quota enforcement and bulk cleanup without restructuring.
+
+**Libraries:** minio@^8.x
+
+---
+
+## TD-08: FFmpeg/FFprobe Invocation Mechanism
+
+**Scope:** Backend
+
+**Capability:** Transversal — covers: Processamento automático do vídeo após upload (extração de duração e metadados), Geração automática de thumbnail a partir de um frame do vídeo
+
+**Context:** TD-03 decided the worker container installs FFmpeg (which bundles `ffprobe`) as a native binary via `apk add ffmpeg` in `Dockerfile.worker`. TD-01 and TD-06 established that the `process-video` Bull job, running on that worker, must — per job — extract duration/metadata (via `ffprobe`) and generate a thumbnail from a frame (via `ffmpeg`). Neither TD decided how the Node.js worker code invokes those two already-installed CLI binaries; this is the missing piece flagged by `/plan-validate` (MD-1).
+
+The historically obvious answer for this in the Node ecosystem, `fluent-ffmpeg`, is **not viable**: its repository was archived and the npm package deprecated ("Package no longer supported") on 2025-05-22, it is incompatible with recent FFmpeg versions, and it will not receive further updates. It is excluded from the options below rather than presented as one, per the project's greenfield/2026 stance.
+
+**Options:**
+
+### Option A: Native `child_process` (`execFile`/`spawn`), zero dependencies
+- Invoke `ffmpeg` / `ffprobe` directly via Node's built-in `node:child_process` module (`execFile`, promisified, or the `node:child_process` promise-returning APIs), capturing `stdout`/`stderr` and mapping non-zero exit codes to a domain error by hand.
+- **Pros:** Zero new dependency, zero added supply-chain surface, full control over args/stdio/signal handling.
+- **Cons:** Verbose invocation boilerplate (manual promisify, manual stdout/stderr buffering, manual exit-code-to-error mapping) has to be written once as an in-house helper and then maintained; no structured error object out of the box.
+
+### Option B: `execa` — thin, actively maintained process-execution wrapper
+- `execa('ffmpeg', args)` / `execa('ffprobe', args)` — promise-based, returns `{ stdout, stderr, exitCode }`, throws a structured `ExecaError` (with captured `stdout`/`stderr` attached) on non-zero exit. Actively maintained (v10.x as of 2026-08, ~20K dependent packages on npm).
+- **Pros:** Removes exactly the boilerplate Option A requires (promisify, output capture, error mapping); the structured error object's `stderr` maps directly onto TD-06's `last_error` column with no hand-rolled capture code; template-literal call syntax reads close to the actual shell command, easing review.
+- **Cons:** One new dependency to track/update; ordinary dependency-hygiene risk (mitigated the same way as every other pinned dependency already in this project).
+
+**Recommendation:** **Option B (`execa`)** — `fluent-ffmpeg` (the "default" prior candidate for this exact problem) is dead, so the real choice is between hand-rolling process-execution boilerplate (Option A) and pulling in one small, actively maintained utility that already solves it (Option B). Building an in-house `child_process` helper is itself code that has to be written, unit-tested, and kept correct for both the `ffmpeg` and `ffprobe` call sites — `execa` is a well-typed, minimal, single-purpose dependency that removes that maintenance burden, and its structured error object is a direct fit for populating TD-06's `last_error` column on failure.
+
+**Decision:** **Option B (`execa`)** — accepted as recommended. `fluent-ffmpeg` is dead (archived/deprecated 2025-05-22), so the real trade-off is hand-rolled `child_process` boilerplate vs. one small maintained wrapper; `execa`'s structured `ExecaError.stderr` maps directly onto TD-06's `last_error` column with no custom capture code.
+
+**Libraries:** execa@^5.x
+
+**Revisions:**
+- 2026-08-17 — Pinned to `execa@^5.x` instead of the originally decided `^10.x`. Rationale: `execa@^10.x` is pure-ESM, and one of its transitive dependencies (`unicorn-magic`, via `npm-run-path`) ships a `package.json` with no `require` export condition at all — real Node (v22+) resolves this fine via native `require(esm)`, but Jest 30's module resolver does not replicate that capability (confirmed by direct reproduction: identical code runs correctly under `ts-node`, fails under Jest regardless of `transformIgnorePatterns` configuration, since it is a resolution failure, not a transform/syntax one). `execa@^5.x` is the last major published before execa's ESM-only migration (v6.0.0), has a fully CommonJS-resolvable dependency tree, and preserves the original rationale (actively-used, structured-error wrapper, not `fluent-ffmpeg`) while remaining testable under this project's existing Jest/ts-jest setup. `ExecaError` is a type-only interface in v5 (no runtime class to `instanceof`-check, unlike v10) — `VideoProcessorService` detects failure via `error instanceof Error && 'stderr' in error && 'exitCode' in error` instead.
 
 ---
 
@@ -291,22 +344,25 @@ Three common approaches exist for video streaming on the web:
 
 | ID | Scope | Decision | Recommendation | Choice |
 |----|-------|----------|---|---|
-| TD-01 | Backend | Job Queue Technology | Redis + Bull | _[pending]_ |
-| TD-02 | Backend | Upload Strategy for 10GB Files | Presigned URL (MinIO) | _[pending]_ |
-| TD-03 | Backend | Video Worker Infrastructure | Dedicated Container | _[pending]_ |
-| TD-04 | Backend | Streaming Protocol | Range Requests (206) | _[pending]_ |
-| TD-05 | Backend | Video Identifier | UUID v4 | _[pending]_ |
-| TD-06 | Backend | Video Status Lifecycle | 4-State Simple Machine | _[pending]_ |
-| TD-07 | Backend | Object Storage Organization | Hierarchical by Channel | _[pending]_ |
+| TD-01 | Backend | Job Queue Technology | Redis + Bull | Redis + Bull (`@nestjs/bull`) |
+| TD-02 | Backend | Upload Strategy for 10GB Files | Presigned URL (MinIO) | Presigned URL + MinIO→Redis notification for completion detection |
+| TD-03 | Backend | Video Worker Infrastructure | Dedicated Container | Dedicated worker container (`Dockerfile.worker`) |
+| TD-04 | Backend | Streaming Protocol | Range Requests (206) | HTTP Range Requests (206 Partial Content) |
+| TD-05 | Backend | Video Identifier | UUID v4 | UUID v4 (native PostgreSQL `UUID`) |
+| TD-06 | Backend | Video Status Lifecycle | 4-State Simple Machine | 4-State machine; `error` terminal, no retry endpoint in Phase 03 |
+| TD-07 | Backend | Object Storage Organization | Hierarchical by Channel | Hierarchical by channel, single bucket |
+| TD-08 | Backend | FFmpeg/FFprobe Invocation Mechanism | `execa` | `execa` (Option B) |
 
 ---
 
 **Next Steps:**
 
-1. Review the recommendations above.
+1. Review the TD-08 recommendation above and fill in its `**Decision:**` field.
 2. Run `/plan-context phase-03-videos` to consolidate the context from these decisions, project requirements, and prior phases.
 3. Follow up with `/plan-validate phase-03-videos` to check for gaps or inconsistencies before proceeding to implementation planning.
 
 **Created by:** Claude Code + research skill  
 **Date:** 2026-07-31  
-**Status:** Pending user review and decision
+**Decisions formalized:** 2026-08-17  
+**TD-08 added:** 2026-08-17 (research follow-up for `/plan-validate` MD-1)  
+**Status:** All 8 TDs decided — ready for `/plan-context phase-03-videos`

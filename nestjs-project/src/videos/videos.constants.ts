@@ -1,0 +1,3 @@
+export const VIDEO_PROCESSING_QUEUE = 'video-processing' as const;
+export const PROCESS_VIDEO_JOB = 'process-video' as const;
+export const UPLOAD_NOTIFICATION_REDIS_KEY = 'video-upload-events' as const;
