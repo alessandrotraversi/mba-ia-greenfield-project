@@ -17,6 +17,7 @@ import {
   TokenReuseDetectedException,
 } from '../common/exceptions/domain.exception';
 import { MailModule } from '../mail/mail.module';
+import { MailService } from '../mail/mail.service';
 import { Channel } from '../channels/entities/channel.entity';
 import { User } from '../users/entities/user.entity';
 import { UsersModule } from '../users/users.module';
@@ -66,13 +67,10 @@ async function createAuthTestModule(): Promise<TestingModule> {
 function captureConfirmationToken(authService: AuthService): Promise<string> {
   return new Promise((resolve) => {
     const mailServiceInstance = (
-      authService as unknown as { mailService: unknown }
+      authService as unknown as { mailService: MailService }
     ).mailService;
     jest
-      .spyOn(
-        mailServiceInstance as Record<string, unknown>,
-        'sendConfirmationEmail',
-      )
+      .spyOn(mailServiceInstance, 'sendConfirmationEmail')
       .mockImplementationOnce((_e: string, _n: string, t: string) => {
         resolve(t);
         return Promise.resolve();
@@ -568,12 +566,15 @@ describe('AuthService — logout (integration)', () => {
 
 function capturePasswordResetToken(authService: AuthService): Promise<string> {
   return new Promise((resolve) => {
-    const mailServiceInstance = (authService as any).mailService;
+    const mailServiceInstance = (
+      authService as unknown as { mailService: MailService }
+    ).mailService;
     jest
       .spyOn(mailServiceInstance, 'sendPasswordResetEmail')
-      .mockImplementationOnce(async (_e: string, _n: string, t: string) =>
-        resolve(t),
-      );
+      .mockImplementationOnce((_e: string, _n: string, t: string) => {
+        resolve(t);
+        return Promise.resolve();
+      });
   });
 }
 

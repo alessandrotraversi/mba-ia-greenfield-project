@@ -1,42 +1,222 @@
 ---
-kind: phase-plan
+kind: phase
 name: phase-03-videos
 test_specs_aware: true
-created_at: 2026-07-31
-status: in-progress
+sources_mtime:
+  docs/phases/phase-03-videos/context.md: "2026-08-17T15:59:23Z"
+  docs/phases/phase-03-videos/library-refs.md: "2026-08-17T14:27:02Z"
+  docs/decisions/technical-decisions-phase-03-videos.md: "2026-08-17T15:52:07Z"
+  docs/decisions/technical-decisions-openapi-docs-nestjs.md: "2026-08-17T14:27:02Z"
 ---
 
-# phase-03-videos — Implementation Plan
+# Phase 03 — Upload e Processamento de Vídeos
 
-## Phase Overview
+## Objective
 
-**Fase 03: Upload e Processamento de Vídeos**
-
-This phase delivers the core video upload, storage, and asynchronous processing infrastructure for StreamTube. It covers:
-- Presigned URL upload flow (10GB files without API memory overhead)
-- Job queue setup (Redis + Bull) for background video processing
-- Dedicated worker container (FFmpeg metadata extraction, thumbnail generation)
-- HTTP Range-based streaming (seekable playback)
-- Video status lifecycle (draft → processing → ready/error)
-- Object storage organization (MinIO with hierarchical structure)
-
-**Affected Subprojects:**
-- `nestjs-project` — Backend API, video entity, upload endpoints, job queue, worker consumer, streaming endpoints
-- `next-frontend` — Deferred; UI surfaces come in later phases
+Deliver the backend infrastructure for video upload, background processing, and streaming: a file storage service for videos and thumbnails, a background job queue, uploads up to 10GB without performance impact, automatic draft pre-registration on upload start, automatic post-upload processing (duration/metadata extraction and thumbnail generation), a unique URL per video, HTTP range-based streaming, and user-initiated download — all backend-only, with `next-frontend` deferred to a future phase.
 
 ---
 
 ## Step Implementations
 
-<!-- SIs will be written in Phase B -->
+### SI-03.1 — Infra: Dependencies, Configuration Namespaces, and Docker Compose
 
-1. **SI-03.1: Infrastructure Setup** — Redis, MinIO, Docker Compose updates, environment configuration
-2. **SI-03.2: Video Entity + Database Migration** — PostgreSQL video table, status enum, relationships to channels
-3. **SI-03.3: Upload Endpoint (Presigned URL Flow)** — POST `/videos/upload-session`, presigned URL generation, draft video creation
-4. **SI-03.4: Job Queue Setup** — Bull queue module registration, @nestjs/bull integration, job schema
-5. **SI-03.5: Video Worker** — Dedicated worker container, FFmpeg process, metadata extraction, thumbnail generation, status updates
-6. **SI-03.6: Streaming & Download Endpoints** — GET `/videos/:id/stream` with Range requests, GET `/videos/:id/download`, Content-Range headers
-7. **SI-03.7: Test Coverage** — Unit + integration + e2e tests for all components
+**Description:** Install the npm dependencies decided for this phase, add namespaced config factories for queue and storage, and wire Redis/MinIO/worker services into Docker Compose.
+
+**Technical actions:**
+
+1. Install `@nestjs/bull@^11.x`, `bull@^5.x`, `minio@^8.x`, and `execa@^10.x` in `nestjs-project` (per `phase-03-videos/TD-01`, `phase-03-videos/TD-07`, `phase-03-videos/TD-08`).
+2. Create `src/config/queue.config.ts` — `registerAs('queue', () => ({...}))` factory reading `REDIS_HOST`/`REDIS_PORT`, following the namespaced pattern (per `phase-01-configuracao-base/TD-03`; per `phase-03-videos/TD-01`).
+3. Create `src/config/storage.config.ts` — `registerAs('storage', () => ({...}))` factory reading `MINIO_ENDPOINT`/`MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`/`MINIO_BUCKET` (per `phase-01-configuracao-base/TD-03`; per `phase-03-videos/TD-07`).
+4. Add `REDIS_HOST`, `REDIS_PORT`, `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET` to the Joi schema in `src/config/env.validation.ts` (per `phase-01-configuracao-base/TD-02`).
+5. Add `redis`, `minio`, and `worker` services to `docker-compose.yml` (per `phase-03-videos/TD-01`, `phase-03-videos/TD-03`).
+
+**Tests:** _(empty — Infra)_
+
+**Dependencies:** none
+
+**Acceptance criteria:**
+
+- `docker compose ps` shows `redis`, `minio`, and `worker` services with status `running` after `docker compose up -d`.
+- The API fails fast at boot with a Joi validation error when a required env var (e.g. `REDIS_HOST`) is missing.
+- `npx tsc --noEmit` passes with the new config factories and dependencies installed.
+
+---
+
+### SI-03.2 — Video Entity and Migration
+
+**Description:** Create the `Video` entity, its TypeORM migration, and repository registration in a new `VideosModule`.
+
+**Technical actions:**
+
+1. Create `src/videos/entities/video.entity.ts` — `Video` entity with `id` (uuid, PK, default `gen_random_uuid()`), `channelId` (uuid), `status` (enum `draft`/`processing`/`ready`/`error`, default `draft`), `storageKey`, `thumbnailKey` (nullable), `durationSeconds` (nullable), `fileSizeBytes` (nullable), `processingAttempts` (default `0`), `lastError` (nullable), `createdAt`, `updatedAt` (per `phase-03-videos/TD-05`, `phase-03-videos/TD-06`, `phase-03-videos/TD-07`).
+2. Add `@ManyToOne(() => Channel)` relation + `channelId` FK column; add indexes on `channelId` and `status`.
+3. Generate the migration via `npm run migration:generate` — creates the `videos` table.
+4. Create `src/videos/videos.module.ts` registering `TypeOrmModule.forFeature([Video])`; import `VideosModule` into `AppModule`.
+
+**Tests:**
+
+| Artifact | Layer | Test file |
+|----------|-------|-----------|
+| `Video` | Integration: constraints, defaults, FK to `Channel` | `src/videos/entities/video.entity.integration-spec.ts` |
+
+**Dependencies:** SI-03.1
+
+**Acceptance criteria:**
+
+- Persisting a `Video` row with only the required fields (`channelId`, `storageKey`) defaults `status` to `draft` and `processingAttempts` to `0`.
+- Persisting a `Video` row with a non-existent `channelId` violates the FK constraint and is rejected.
+- The migration applies cleanly against an empty database (`npm run migration:run`) and reverts cleanly (`npm run migration:revert`).
+
+---
+
+### SI-03.3 — Bull Queue Module and Worker Bootstrap
+
+**Description:** Register the `video-processing` Bull queue in the API module and create the standalone worker container entrypoint that consumes it.
+
+**Technical actions:**
+
+1. Register `BullModule.forRootAsync` (Redis connection from `queueConfig`) + `BullModule.registerQueue({ name: 'video-processing' })` in `AppModule` (per `phase-03-videos/TD-01`).
+2. Create `nestjs-project/Dockerfile.worker` — `node:22-alpine` base, `apk add ffmpeg`, builds the same `dist/` output as the API image (per `phase-03-videos/TD-03`).
+3. Create `src/worker.main.ts` — a separate NestJS application bootstrap (no HTTP listener) loading `VideosModule` + `BullModule`, used as the worker container's entrypoint (per `phase-03-videos/TD-03`).
+4. Add a `start:worker` npm script that runs `src/worker.main.ts`.
+
+**Tests:**
+
+| Artifact | Layer | Test file |
+|----------|-------|-----------|
+| `AppModule` (Bull wiring) | Unit: compilation test — `BullModule` registers without error given valid queue config | `src/app.module.compilation-spec.ts` |
+
+**Dependencies:** SI-03.1
+
+**Acceptance criteria:**
+
+- The API container boots successfully with the `video-processing` queue registered and connected to Redis.
+- The worker container boots independently of the API container and connects to the same Redis queue.
+- `ffmpeg -version` and `ffprobe -version` succeed when run inside the worker container.
+
+---
+
+### SI-03.4 — Endpoint POST /videos/upload-session
+
+**Route:** POST /videos/upload-session
+**Test Specs:** see `nestjs-project/specs/videos-upload-session.plan.md`
+**Authorization:** Authenticated (owner)
+
+**Description:** Implement the upload-session endpoint — validates the requested file size/type, creates a draft `Video` record scoped to the caller's channel, and returns a MinIO presigned PUT URL.
+
+**Technical actions:**
+
+1. Create `src/videos/dto/create-upload-session.dto.ts` — `CreateUploadSessionDto` with `fileName` (string, required), `contentType` (string, required, must start with `video/`), `fileSizeBytes` (number, required, max `10 * 1024^3`) (per `phase-03-videos/TD-02`, `### API Contracts`).
+2. Create `src/videos/videos.service.ts` — `VideosService.createUploadSession(channelId, dto)`: builds `storageKey = channels/{channelId}/videos/{videoId}.mp4`, persists a draft `Video` row, calls MinIO `presignedPutObject(bucket, storageKey, expirySeconds)` (per `phase-03-videos/TD-02`, `phase-03-videos/TD-05`, `phase-03-videos/TD-07`; `minio` in `library-refs.md`).
+3. Create `src/videos/videos.controller.ts` — `VideosController` with `@UseGuards(AuthGuard)` `@Post('upload-session')`, deriving `channelId` from the authenticated user's channel, returning 201 with `{ videoId, uploadUrl, expiresAt, storageKey }` (per `phase-02-auth`'s JWT access guard).
+4. Add `@ApiOperation`, `@ApiResponse`, `@ApiBody` decorators to the endpoint (per `openapi-docs-nestjs/TD-01` Revisions — explicit decorators required beyond the CLI plugin's automatic schema inference).
+
+**Tests:**
+
+| Artifact | Layer | Test file |
+|----------|-------|-----------|
+| `VideosService.createUploadSession` | Unit: rejects oversized/non-video input before calling MinIO (mock repo + mock MinIO client) | `src/videos/videos.service.spec.ts` |
+| `VideosService.createUploadSession` | Integration: persists draft `Video` row with the correct `storageKey` | `src/videos/videos.service.integration-spec.ts` |
+
+**Dependencies:** SI-03.2
+
+**Acceptance criteria:**
+
+- `POST /videos/upload-session` with a valid body returns `201` with `videoId`, `uploadUrl`, `expiresAt`, and `storageKey` matching `channels/{channelId}/videos/{videoId}.mp4`.
+- `POST /videos/upload-session` persists a `Video` row with `status: draft` before returning the response.
+- `POST /videos/upload-session` with `fileSizeBytes` exceeding 10GB returns `400` with `FILE_TOO_LARGE` and creates no `Video` row.
+- `POST /videos/upload-session` with a non-video `contentType` returns `400` with `UNSUPPORTED_CONTENT_TYPE`.
+- `POST /videos/upload-session` without a valid access token returns `401`.
+
+---
+
+### SI-03.5 — Upload Completion Notification Consumer
+
+**Description:** Subscribe to MinIO's Redis upload-completion notification, transition the matching draft `Video` to `processing`, and enqueue the `process-video` job.
+
+**Technical actions:**
+
+1. Configure the MinIO bucket notification via `MINIO_NOTIFY_REDIS_*` env vars, publishing `s3:ObjectCreated:Put` events to Redis (per `phase-03-videos/TD-02`).
+2. Create `src/videos/upload-notification.listener.ts` — subscribes to the configured Redis channel/list on module init, parses the notification's object key back to `videoId`.
+3. On receipt, `VideosService.markProcessing(videoId)`: transitions `Video.status` from `draft` to `processing`, then `queue.add('process-video', { videoId })` (per `phase-03-videos/TD-01`, `phase-03-videos/TD-02`, `phase-03-videos/TD-06`).
+4. Register the listener as a provider in `VideosModule`.
+
+**Tests:**
+
+| Artifact | Layer | Test file |
+|----------|-------|-----------|
+| `VideosService.markProcessing` | Integration: transitions status `draft`→`processing` and enqueues the job (real Redis + Bull in Docker) | `src/videos/videos.service.integration-spec.ts` |
+
+**Dependencies:** SI-03.2, SI-03.3
+
+**Acceptance criteria:**
+
+- A MinIO upload-completion notification for a known `draft` video's object key transitions that video's status to `processing` and enqueues a `process-video` job carrying the matching `videoId`.
+- A notification for an object key with no matching draft video is ignored without throwing.
+
+---
+
+### SI-03.6 — Video Processor Worker (Metadata Extraction and Thumbnail Generation)
+
+**Description:** Worker job processor that extracts video duration via `ffprobe`, generates a thumbnail via `ffmpeg`, uploads the thumbnail to MinIO, and finalizes the video's status.
+
+**Technical actions:**
+
+1. Create `src/videos/video-processor.service.ts` — `@Processor('video-processing')` with a `@Process('process-video')` handler receiving `Job<{ videoId: string }>`.
+2. Run `execa('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', tmpFilePath])` and parse `format.duration` (per `phase-03-videos/TD-08`; `execa` in `library-refs.md`).
+3. Run `execa('ffmpeg', ['-ss', '1', '-i', tmpFilePath, '-vframes', '1', thumbnailTmpPath])`, then upload the result to MinIO at `thumbnailKey` (per `phase-03-videos/TD-03`, `phase-03-videos/TD-07`, `phase-03-videos/TD-08`).
+4. On success, update `Video`: `durationSeconds`, `thumbnailKey`, `fileSizeBytes`, `status: ready`. On `execa` failure (`ExecaError`), increment `processingAttempts`, set `lastError: error.stderr`, `status: error` (per `phase-03-videos/TD-06`, `phase-03-videos/TD-08`).
+5. Register `VideoProcessorService` as a provider consumed by the worker bootstrap (`src/worker.main.ts`).
+
+**Tests:**
+
+| Artifact | Layer | Test file |
+|----------|-------|-----------|
+| `VideoProcessorService` | Integration: real `ffprobe`/`ffmpeg` invocation via `execa` against a fixture video — extracts duration, generates thumbnail, transitions to `ready` | `src/videos/video-processor.service.integration-spec.ts` |
+| `VideoProcessorService` | Integration: `ffmpeg`/`ffprobe` failure (corrupt fixture) sets `status: error`, increments `processingAttempts`, records `lastError` from `ExecaError.stderr` | `src/videos/video-processor.service.integration-spec.ts` |
+
+**Dependencies:** SI-03.3, SI-03.5
+
+**Acceptance criteria:**
+
+- Processing a valid uploaded video sets `durationSeconds` to the video's actual duration, `thumbnailKey` to a valid object key, `fileSizeBytes` to the object's actual size, and `status: ready`.
+- Processing a corrupt or non-video file sets `status: error`, increments `processingAttempts` by `1`, and records `lastError` with the captured `ffmpeg`/`ffprobe` stderr output.
+- No automatic retry occurs after a processing failure — the job does not requeue itself.
+
+---
+
+### SI-03.7 — Endpoint GET /videos/:id/stream
+
+**Route:** GET /videos/:id/stream
+**Test Specs:** see `nestjs-project/specs/videos-stream.plan.md`
+**Authorization:** Anonymous
+
+**Description:** Implement the streaming/download endpoint — serves the video from MinIO via HTTP Range Requests, supporting both partial (playback/seek) and full (download) responses.
+
+**Technical actions:**
+
+1. Add `VideosService.getStreamableVideo(id)`: look up the video, throw `VideoNotFoundException` if missing, throw `VideoNotReadyException` if `status !== 'ready'` (per `phase-03-videos/TD-06`).
+2. On `Range` header present, parse `bytes=start-end`, call MinIO `getPartialObject(bucket, storageKey, start, length)`, return `206` with `Content-Range`/`Content-Length`/`Accept-Ranges` (per `phase-03-videos/TD-04`, `phase-03-videos/TD-07`; `minio` in `library-refs.md`).
+3. On `Range` header absent, call MinIO `getObject(bucket, storageKey)`, return `200` with the full stream (per `phase-03-videos/TD-04`).
+4. Add `@Get(':id/stream')` to `VideosController` — no auth guard (public, per Authorization Matrix) — piping the MinIO stream to the HTTP response.
+5. Add `@ApiOperation`, `@ApiResponse`, `@ApiParam` decorators (per `openapi-docs-nestjs/TD-01` Revisions).
+
+**Tests:**
+
+| Artifact | Layer | Test file |
+|----------|-------|-----------|
+| `VideosService.getStreamableVideo` | Unit: throws `VideoNotFoundException`/`VideoNotReadyException` per status (mock repo) | `src/videos/videos.service.spec.ts` |
+
+**Dependencies:** SI-03.2, SI-03.6
+
+**Acceptance criteria:**
+
+- `GET /videos/:id/stream` for a `ready` video without a `Range` header returns `200` with the full video byte stream.
+- `GET /videos/:id/stream` for a `ready` video with a valid `Range` header returns `206` with the requested byte range and a correct `Content-Range` header.
+- `GET /videos/:id/stream` for a non-existent video id returns `404` with `VIDEO_NOT_FOUND`.
+- `GET /videos/:id/stream` for a video whose status is not `ready` returns `409` with `VIDEO_NOT_READY`.
+- `GET /videos/:id/stream` is reachable without an `Authorization` header (anonymous access succeeds).
 
 ---
 
@@ -44,489 +224,147 @@ This phase delivers the core video upload, storage, and asynchronous processing 
 
 ### Data Model
 
-**Video Entity**
+#### Video
 
-```typescript
-// Video (stored in PostgreSQL)
-{
-  id: UUID (primary key, native PostgreSQL UUID type),
-  channelId: UUID (foreign key to channels table),
-  title: VARCHAR(500),
-  description: TEXT (nullable),
-  videoUrl: VARCHAR(1024) // S3/MinIO key: channels/{channelId}/videos/{id}.mp4
-  thumbnailUrl: VARCHAR(1024) // S3/MinIO key: channels/{channelId}/thumbnails/{id}.jpg
-  duration: INT (milliseconds, nullable until processing completes),
-  metadata: JSONB (FFmpeg output: codec, bitrate, resolution, etc.),
-  status: ENUM ['draft', 'processing', 'ready', 'error'],
-  processingAttempts: INT (default 0, for future retry logic),
-  lastError: TEXT (nullable, error message from processing),
-  createdAt: TIMESTAMP,
-  updatedAt: TIMESTAMP
-}
-```
+| Field | Type | Constraints |
+|-------|------|-------------|
+| id | uuid | PK, default `gen_random_uuid()` *(per phase-03-videos/TD-05)* |
+| channelId | uuid | FK → `Channel.id`, not null *(per phase-03-videos/TD-07 — object keys are namespaced by channel)* |
+| status | enum(`draft`, `processing`, `ready`, `error`) | not null, default `draft` *(per phase-03-videos/TD-06)* |
+| storageKey | varchar | not null — object key `channels/{channelId}/videos/{id}.mp4` *(per phase-03-videos/TD-07)* |
+| thumbnailKey | varchar | nullable — object key `channels/{channelId}/thumbnails/{id}.jpg`, populated once processing succeeds *(per phase-03-videos/TD-07, phase-03-videos/TD-03)* |
+| durationSeconds | integer | nullable — populated by `ffprobe` metadata extraction *(per phase-03-videos/TD-08)* |
+| fileSizeBytes | bigint | nullable — filled with the actual uploaded size once the MinIO→Redis upload-completion notification is received *(per phase-03-videos/TD-02)* |
+| processingAttempts | integer | not null, default `0` *(per phase-03-videos/TD-06)* |
+| lastError | text | nullable — populated from the worker's captured error output on failure *(per phase-03-videos/TD-06, phase-03-videos/TD-08)* |
+| createdAt | timestamptz | default `now()` |
+| updatedAt | timestamptz | default `now()`, auto-updated on write |
 
-**Database Migration:**
-
-```sql
-CREATE TABLE videos (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-  title VARCHAR(500) NOT NULL,
-  description TEXT,
-  video_url VARCHAR(1024),
-  thumbnail_url VARCHAR(1024),
-  duration INT,
-  metadata JSONB,
-  status VARCHAR(20) NOT NULL DEFAULT 'draft',
-  processing_attempts INT DEFAULT 0,
-  last_error TEXT,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  CONSTRAINT fk_channel FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
-);
-
-CREATE INDEX idx_videos_channel_id ON videos(channel_id);
-CREATE INDEX idx_videos_status ON videos(status);
-CREATE INDEX idx_videos_created_at ON videos(created_at DESC);
-```
-
-**Status Lifecycle (4-State Machine):**
-- `draft` — Video created, upload session initiated, not yet processed
-- `processing` — Job enqueued or in-progress
-- `ready` — Processing succeeded, video ready for playback
-- `error` — Processing failed; awaiting manual retry or admin action
-
----
+**Relations:** `Video` belongs to `Channel` (many-to-one); `Channel` (inherited from phase-02-auth) is not modified by this phase.
+**Indexes:** index on `channelId`; index on `status`.
 
 ### API Contracts
 
-**1. POST /videos/upload-session**
+#### POST /videos/upload-session (SI-03.4)
 
-Create an upload session and get a presigned URL for direct client → MinIO upload.
+**Request headers:**
+- Authorization: Bearer {accessToken} — required (per phase-02-auth/TD-02 JWT access guard)
+- Content-Type: application/json
 
-```typescript
-// Request (authenticated user required)
-{
-  title: string;
-  description?: string;
-}
+**Request body:**
+- fileName: string, required
+- contentType: string, required — must be a video MIME type (e.g. `video/mp4`)
+- fileSizeBytes: number, required — must not exceed 10GB (`10 * 1024^3` bytes) *(per phase-03-videos/TD-02)*
 
-// Response (201 Created)
-{
-  videoId: UUID;
-  uploadUrl: string; // Presigned PUT URL (valid 2 hours)
-  videoKey: string; // Storage key: channels/{channelId}/videos/{videoId}.mp4
-  expiresIn: number; // Seconds until presigned URL expires
-  video: {
-    id: UUID;
-    title: string;
-    status: 'draft';
-    createdAt: ISO8601;
-  }
-}
+**Response 201:**
+- videoId: string (uuid) *(per phase-03-videos/TD-05)*
+- uploadUrl: string — MinIO presigned PUT URL, TTL ~2 hours *(per phase-03-videos/TD-02)*
+- expiresAt: string (ISO-8601)
+- storageKey: string — `channels/{channelId}/videos/{videoId}.mp4` *(per phase-03-videos/TD-07)*
 
-// Error (400, 401, 403, 503)
-{
-  error: string;
-  message: string;
-}
-```
+**Error responses:**
+- 400 FILE_TOO_LARGE: fileSizeBytes exceeds the 10GB cap
+- 400 UNSUPPORTED_CONTENT_TYPE: contentType is not a supported video MIME type
+- 401 UNAUTHENTICATED: missing or invalid access token *(per phase-02-auth/TD-02, phase-02-auth/TD-07 error envelope)*
 
-**2. GET /videos/:id/stream**
+---
 
-Stream video file with Range request support (206 Partial Content).
+#### GET /videos/:id/stream (SI-03.7)
 
-```typescript
-// Request headers (recommended)
-Range: bytes=0-1048575  // Request first 1MB
-Accept-Ranges: bytes
+**Request headers:**
+- Range: bytes={start}-{end} — optional; absent → full content with `200`, present → partial content with `206` *(per phase-03-videos/TD-04)*
 
-// Response (200 OK or 206 Partial Content)
-HTTP/1.1 200 OK
-Content-Type: video/mp4
-Content-Length: 5368709120
-Accept-Ranges: bytes
-[full video file]
+**Response 200:** Full byte stream. `Content-Type: video/*`, `Content-Length`, `Accept-Ranges: bytes`. Returned when no `Range` header is sent (used for direct download as well as playback — same mechanism per phase-03-videos/TD-04).
 
-// OR partial response
-HTTP/1.1 206 Partial Content
-Content-Type: video/mp4
-Content-Length: 1048576
-Content-Range: bytes 0-1048575/5368709120
-[requested byte range]
+**Response 206:** Partial content. `Content-Range: bytes {start}-{end}/{total}`, `Content-Length`, `Accept-Ranges: bytes`.
 
-// Error (404, 503)
-{
-  error: string;
-  message: string;
-}
-```
-
-**3. GET /videos/:id/download**
-
-Download video file (forces `Content-Disposition: attachment`).
-
-```typescript
-// Request
-GET /videos/:id/download
-
-// Response (200 OK)
-HTTP/1.1 200 OK
-Content-Type: video/mp4
-Content-Disposition: attachment; filename="video-title.mp4"
-Content-Length: 5368709120
-[full video file]
-
-// Error (404, 503)
-{
-  error: string;
-  message: string;
-}
-```
-
-**4. GET /videos/:id**
-
-Fetch video metadata and status.
-
-```typescript
-// Request
-GET /videos/:id
-
-// Response (200 OK)
-{
-  id: UUID;
-  channelId: UUID;
-  title: string;
-  description?: string;
-  videoUrl: string; // S3 key
-  thumbnailUrl?: string; // S3 key
-  duration?: number; // milliseconds
-  metadata?: {
-    codec: string;
-    bitrate: string;
-    resolution: string;
-    frameRate: string;
-  };
-  status: 'draft' | 'processing' | 'ready' | 'error';
-  processingAttempts: number;
-  lastError?: string;
-  createdAt: ISO8601;
-  updatedAt: ISO8601;
-}
-
-// Error (404, 503)
-{
-  error: string;
-  message: string;
-}
-```
+**Error responses:**
+- 404 VIDEO_NOT_FOUND: no video exists with the given id
+- 409 VIDEO_NOT_READY: video status is not `ready` (still `draft`, `processing`, or terminal `error`) *(per phase-03-videos/TD-06)*
+- 416 RANGE_NOT_SATISFIABLE: the requested byte range is outside the video's actual size
 
 ---
 
 ### Authorization Matrix
 
-| Endpoint | Method | Public? | Auth Required? | Ownership | Notes |
-|----------|--------|---------|----------------|-----------|-------|
-| `/videos/upload-session` | POST | No | Yes | Self | Only authenticated users can create upload sessions |
-| `/videos/:id/stream` | GET | Yes (if status=ready) | No | — | Stream only ready videos; draft/error/processing are private |
-| `/videos/:id/download` | GET | No | Yes | Self or Owner | Only authenticated users can download; future: check ownership or channel permissions |
-| `/videos/:id` | GET | Yes (metadata only) | No | — | Public metadata fetch (returns only non-sensitive fields) |
-
-**Inherited Auth Mechanisms (from Phase 02):**
-- `@UseGuards(JwtAuthGuard)` — Validates JWT access token from `Authorization: Bearer` header
-- `@IsPublic()` decorator — Exempts endpoints from auth checks
-- Session-based refresh token rotation (PostgreSQL-backed)
-
----
+| Endpoint | Anonymous | Authenticated | Owner |
+|----------|-----------|----------------|-------|
+| POST /videos/upload-session | ✗ | ✓ | ✓ *(video is created under the caller's own channel — per phase-02-auth's one-channel-per-user model)* |
+| GET /videos/:id/stream | ✓ | ✓ | ✓ *(public playback/download — matches project overview: anonymous users watch freely)* |
 
 ### Error Catalog
 
-**Domain Error Codes (via inherited Custom Exception Filter from Phase 02):**
+_Uses the custom domain exception filter envelope established by phase-02-auth/TD-07 (`{ statusCode, error, message }`)._
 
-| Status | Code | Message | Context |
-|--------|------|---------|---------|
-| 400 | VIDEO_INVALID_SIZE | File exceeds 10GB limit | Upload session creation |
-| 400 | VIDEO_INVALID_TITLE | Title is empty or too long | Upload session validation |
-| 409 | VIDEO_CONFLICT | Upload already in progress for this file | Rate limiting duplicate uploads |
-| 422 | VIDEO_PROCESSING_FAILED | FFmpeg processing error: {details} | Worker job failure |
-| 404 | VIDEO_NOT_FOUND | Video with ID {id} does not exist | Streaming, download, metadata fetch |
-| 503 | VIDEO_STORAGE_UNAVAILABLE | MinIO/S3 service unreachable | Presigned URL generation, file streaming |
-| 503 | QUEUE_SERVICE_UNAVAILABLE | Redis job queue unavailable | Job enqueue failure |
+| errorCode | HTTP | Trigger |
+|-----------|------|---------|
+| FILE_TOO_LARGE | 400 | Upload session requested with `fileSizeBytes` exceeding the 10GB cap |
+| UNSUPPORTED_CONTENT_TYPE | 400 | Upload session requested with a non-video `contentType` |
+| VIDEO_NOT_FOUND | 404 | Requested video id does not exist |
+| VIDEO_NOT_READY | 409 | Stream/download requested before processing completes (status `draft`, `processing`, or `error`) |
+| RANGE_NOT_SATISFIABLE | 416 | `Range` header requests bytes outside the video's actual size |
 
-**Implementation Pattern (inherited from Phase 02):**
-```typescript
-throw new VideoException(
-  'VIDEO_PROCESSING_FAILED',
-  'FFmpeg stderr: ...',
-  HttpStatus.UNPROCESSABLE_ENTITY
-);
-```
+### Events/Messages
 
-All exceptions are caught by `CustomExceptionFilter`, which transforms them to:
+#### minio-upload-notification
+
+**Payload:**
+
 ```json
-{
-  "statusCode": 422,
-  "error": "VIDEO_PROCESSING_FAILED",
-  "message": "FFmpeg stderr: ..."
-}
+{ "EventName": "s3:ObjectCreated:Put", "Key": "streamtube-videos/channels/{channelId}/videos/{videoId}.mp4", "Records": [ "..." ] }
 ```
+
+**Producer:** MinIO (native bucket notification via `MINIO_NOTIFY_REDIS_*` config — not application code) (per `phase-03-videos/TD-02`)
+**Consumer:** Backend Redis subscriber, SI-03.5 (per `phase-03-videos/TD-02`)
+**Trigger:** The client's PUT to the presigned upload URL completes successfully.
+**Delivery semantics:** best-effort (native MinIO Redis notification target; no NestJS-level retry) (per `phase-03-videos/TD-02`)
 
 ---
 
-### Events / Messages
+#### process-video (Bull job, `video-processing` queue)
 
-**Job Queue Events (Bull + Redis):**
+**Payload:**
 
-| Event | Source | Payload | Consumers |
-|-------|--------|---------|-----------|
-| `video.upload-initiated` | Upload controller | `{ videoId, uploadUrl, expiresAt }` | Logging, metrics (future) |
-| `video.upload-completed` | Upload polling / S3 event | `{ videoId, fileSize, uploadedAt }` | Job enqueue (add to video-processing queue) |
-| `video-processing:created` | Upload controller → Queue | `{ videoId, channelId, videoKey, thumbnailKey }` | Worker subscription |
-| `video-processing:completed` | Worker job processor | `{ videoId, duration, metadata, thumbnailUrl, completedAt }` | DB update (status → ready), logging |
-| `video-processing:failed` | Worker job error handler | `{ videoId, error, failedAt, attempt }` | DB update (status → error, lastError), retry schedule (future) |
-
-**Implementation Pattern:**
-```typescript
-// Enqueue a job
-const job = await this.videoQueue.add(
-  'process-video',
-  { videoId, videoKey, thumbnailKey },
-  { attempts: 3, backoff: { type: 'exponential', delay: 2000 } }
-);
-
-// Process a job
-@Processor('video-processing')
-export class VideoWorker {
-  @Process('process-video')
-  async handleVideoProcessing(job: Job<ProcessVideoPayload>) {
-    // FFmpeg calls, DB updates
-  }
-
-  @OnEvent('error')
-  async handleJobError(error: Error) {
-    // Retry scheduling, error logging
-  }
-}
+```json
+{ "videoId": "uuid" }
 ```
 
----
-
-### Dependency Map
-
-**New Phase-03 Dependencies:**
-- `@nestjs/bull@^11.x` — NestJS Bull queue module
-- `bull@^5.x` — Underlying job queue library
-- `minio@^8.x` — S3-compatible object storage SDK
-- `redis` (Docker service) — Job queue backend
-- `minio` (Docker service) — Object storage backend
-- `ffmpeg` (in worker Docker image) — Video processing binary
-
-**Inherited Dependencies (from prior phases):**
-- Config: `@nestjs/config@^4.x`, `joi@^17.x`
-- Auth: `@nestjs/jwt@^11.0.0`, `@nestjs/throttler@^6.x`
-- Validation: `class-validator@^0.14.x`, `class-transformer@^0.5.x`
-- Database: `TypeORM`, `PostgreSQL`
-
-**Module Dependency Graph:**
-```
-VideoModule (new)
-├─ VideosController (handles upload-session, stream, download, metadata endpoints)
-├─ VideosService (business logic: presigned URL generation, status updates)
-├─ BullModule.registerQueue({ name: 'video-processing' })
-├─ TypeOrmModule.forFeature([Video])
-├─ MinioClientModule (new, wraps minio SDK)
-└─ [inherited] ConfigModule, AuthModule, ChannelsModule
-
-WorkerModule (separate container, new)
-├─ VideoWorker (@Processor('video-processing'))
-├─ BullModule.registerQueue({ name: 'video-processing' })
-├─ TypeOrmModule.forFeature([Video])
-└─ FFmpegService (new, calls ffprobe / ffmpeg binaries)
-```
-
----
-
-### Deliverables
-
-**Backend (nestjs-project):**
-- [ ] Database migration: Video entity + status enum
-- [ ] `src/entities/video.entity.ts` — TypeORM Video entity
-- [ ] `src/modules/videos/` — Videos module with controller + service
-- [ ] `src/modules/videos/controllers/videos.controller.ts`
-- [ ] `src/modules/videos/services/videos.service.ts`
-- [ ] `src/config/storage.config.ts` — MinIO configuration factory
-- [ ] `src/config/queue.config.ts` — Redis/Bull configuration factory
-- [ ] `src/modules/minio/` — MinIO client module (wraps SDK)
-- [ ] Presigned URL generation via MinIO SDK
-- [ ] `src/modules/worker/` — Video worker module (separate container)
-- [ ] `src/modules/worker/processors/video.processor.ts` — FFmpeg integration
-- [ ] `src/services/ffmpeg.service.ts` — FFmpeg wrapper (ffprobe, metadata extraction, thumbnail generation)
-- [ ] GET `/videos/:id/stream` endpoint with Range request support
-- [ ] GET `/videos/:id/download` endpoint
-- [ ] GET `/videos/:id` metadata endpoint
-- [ ] HTTP 206 Partial Content response handling
-- [ ] Unit tests (videos service, controller, processor, ffmpeg service)
-- [ ] Integration tests (DB + Redis + MinIO real)
-- [ ] E2E test: full upload → process → stream workflow
-- [ ] Environment variables documentation (REDIS_HOST, MINIO_ENDPOINT, etc.)
-
-**Infrastructure:**
-- [ ] `Dockerfile.worker` — Worker container (Node + FFmpeg)
-- [ ] `docker-compose.yml` updates:
-  - [ ] Redis service
-  - [ ] MinIO service
-  - [ ] Worker service
-- [ ] `.env` updates with queue and storage config
-- [ ] `src/config/env.validation.ts` updates (new env vars for Redis, MinIO)
-
-**Frontend (next-frontend):**
-- Deferred to later phase; no UI delivery in phase-03
-
----
-
-## Dependency Map (Detailed)
-
-### NPM Packages to Install
-
-```bash
-npm install --save @nestjs/bull bull minio
-npm install --save-dev @types/minio
-```
-
-### Docker Services to Configure
-
-**Redis (Job Queue Backend)**
-```yaml
-redis:
-  image: redis:7-alpine
-  ports:
-    - "6379:6379"
-  healthcheck:
-    test: ["CMD", "redis-cli", "ping"]
-    interval: 10s
-    timeout: 5s
-    retries: 5
-```
-
-**MinIO (Object Storage)**
-```yaml
-minio:
-  image: minio/minio:latest
-  ports:
-    - "9000:9000"
-    - "9001:9001"  # Console UI
-  environment:
-    MINIO_ROOT_USER: minioadmin
-    MINIO_ROOT_PASSWORD: minioadmin
-  command: server /data --console-address ":9001"
-  volumes:
-    - minio_data:/data
-  healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-    interval: 30s
-    timeout: 20s
-    retries: 3
-```
-
-**Video Worker Container**
-```yaml
-worker:
-  build:
-    context: ./nestjs-project
-    dockerfile: Dockerfile.worker
-  depends_on:
-    - db
-    - redis
-    - minio
-  environment:
-    - NODE_ENV=development
-    - DATABASE_URL=postgresql://user:pass@db:5432/streamtube
-    - REDIS_HOST=redis
-    - REDIS_PORT=6379
-    - MINIO_ENDPOINT=minio:9000
-    - MINIO_REGION=us-east-1
-    - MINIO_ACCESS_KEY=minioadmin
-    - MINIO_SECRET_KEY=minioadmin
-    - MINIO_USE_SSL=false
-```
-
-### Environment Variables
-
-**Add to `.env`:**
-```bash
-# Job Queue (Redis)
-REDIS_HOST=redis
-REDIS_PORT=6379
-
-# Object Storage (MinIO)
-MINIO_ENDPOINT=minio:9000
-MINIO_REGION=us-east-1
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-MINIO_USE_SSL=false
-```
-
-**Add to `src/config/env.validation.ts`:**
-```typescript
-REDIS_HOST: Joi.string().default('redis'),
-REDIS_PORT: Joi.number().default(6379),
-MINIO_ENDPOINT: Joi.string().required(),
-MINIO_REGION: Joi.string().default('us-east-1'),
-MINIO_ACCESS_KEY: Joi.string().required(),
-MINIO_SECRET_KEY: Joi.string().required(),
-MINIO_USE_SSL: Joi.boolean().default(false),
-```
-
----
-
-## Inherited Conventions to Match
-
-**Configuration Pattern (from Phase 01):**
-- Use `@nestjs/config` with `registerAs()` factory pattern
-- Create `src/config/queue.config.ts` and `src/config/storage.config.ts` as namespaced factories
-- Inject via `@Inject(queueConfig.KEY)` with `ConfigType<typeof queueConfig>`
-- Both factories are dual-purpose: importable as plain functions for non-DI contexts + DI injection tokens
-
-**Error Handling Pattern (from Phase 02):**
-- Use custom `VideoException` extending `DomainException`
-- Throw with domain error codes: `'VIDEO_PROCESSING_FAILED'`, `'VIDEO_NOT_FOUND'`, etc.
-- Caught by global `CustomExceptionFilter` and transformed to standard JSON response
-
-**Auth Pattern (from Phase 02):**
-- Use `@UseGuards(JwtAuthGuard)` for protected endpoints
-- Use `@IsPublic()` for public endpoints (overrides guard)
-- Auth user is available via `@User() user: { userId: UUID }` parameter
-
-**DTO Validation (from Phase 02):**
-- Use `class-validator` decorators on DTOs
-- Validation pipes handle request transformation automatically
-
-**Database Pattern (from Phase 01):**
-- Use TypeORM with `@Column`, `@PrimaryGeneratedColumn`, `@ManyToOne`, etc.
-- Follow entity naming: singular (`Video`, not `Videos`)
-- TypeORM `autoLoadEntities: true` in AppModule
-
----
-
-## Testing Requirements (from context.md)
-
-### nestjs-project
-
-| Artifact | Unit | Integration | E2E |
-|----------|------|-------------|-----|
-| Video entity + migration | ✓ | ✓ (DB real) | — |
-| Upload controller + service | ✓ | ✓ (MinIO presigned URL mocked via MSW) | — |
-| Queue service (Bull) | ✓ | ✓ (Redis real) | — |
-| Video worker (FFmpeg) | ✓ | ✓ (container real) | — |
-| Streaming endpoint (Range) | ✓ | ✓ | — |
-| E2E workflow | — | — | ✓ (full cycle: upload → queue → process → stream) |
-
-**Test Patterns Inherited:**
-- MSW for HTTP mocking (MinIO presigned URL generation)
-- TypeORM repositories for DB integration tests
-- @nestjs/testing for module setup
-- jest for test runner and assertions
+**Producer:** Backend Redis subscriber, SI-03.5 — enqueues on receipt of the `minio-upload-notification` event, transitioning the video from `draft` to `processing` (per `phase-03-videos/TD-01`, `phase-03-videos/TD-02`)
+**Consumer:** Worker container's video processor, SI-03.6 — runs `ffprobe`/`ffmpeg` via `execa` (per `phase-03-videos/TD-03`, `phase-03-videos/TD-08`)
+**Trigger:** `minio-upload-notification` received for a `draft` video.
+**Delivery semantics:** at-least-once (Bull default). No automatic retry on job failure — the video transitions to the terminal `error` state instead; `processingAttempts` and `lastError` are recorded (per `phase-03-videos/TD-06`)
 
 ---
 
 <!-- phase-a-complete -->
+
+## Dependency Map
+
+```
+SI-03.1 (root)
+├── SI-03.2 — depends on SI-03.1 (config + Docker services must exist before entity/migration)
+│   ├── SI-03.4 — depends on SI-03.2 (entity must exist before upload-session endpoint)
+│   ├── SI-03.5 — depends on SI-03.2, SI-03.3 (entity + queue must exist before the notification consumer)
+│   └── SI-03.7 — depends on SI-03.2, SI-03.6 (entity + processor must exist before the streaming endpoint)
+└── SI-03.3 — depends on SI-03.1 (config + Docker services must exist before Bull/worker wiring)
+    ├── SI-03.5 — depends on SI-03.2, SI-03.3 (see above)
+    └── SI-03.6 — depends on SI-03.3, SI-03.5 (worker + notification consumer must exist before the processor)
+```
+
+---
+
+## Deliverables
+
+- [x] SI-03.1 — Infra: Dependencies, Configuration Namespaces, and Docker Compose
+- [x] SI-03.2 — Video Entity and Migration
+- [x] SI-03.3 — Bull Queue Module and Worker Bootstrap
+- [x] SI-03.4 — Endpoint POST /videos/upload-session
+- [x] SI-03.5 — Upload Completion Notification Consumer
+- [x] SI-03.6 — Video Processor Worker (Metadata Extraction and Thumbnail Generation)
+- [x] SI-03.7 — Endpoint GET /videos/:id/stream
+
+**Full test suites:**
+
+- [x] Backend tests pass (`docker compose exec nestjs-api npm test -- --runInBand`)
+- [x] E2E tests pass (`docker compose exec nestjs-api npm run test:e2e`)
+- [x] Type/compilation checks pass (`docker compose exec nestjs-api npx tsc --noEmit`)

@@ -31,12 +31,17 @@ describe('Database migrations (integration)', () => {
 
     await dataSource.initialize();
 
+    // Tables must be dropped before the enum type they reference — DROP TYPE
+    // fails with a dependency error while any column still uses it.
     await Promise.all([
       ...MANAGED_TABLES.map((table) =>
         dataSource.query(`DROP TABLE IF EXISTS "${table}" CASCADE`),
       ),
       dataSource.query(`DROP TABLE IF EXISTS "migrations" CASCADE`),
     ]);
+    await dataSource.query(
+      `DROP TYPE IF EXISTS "public"."verification_tokens_type_enum"`,
+    );
   });
 
   afterAll(async () => {
