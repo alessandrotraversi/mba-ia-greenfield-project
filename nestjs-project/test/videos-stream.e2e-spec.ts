@@ -133,7 +133,7 @@ describe('GET /videos/:id/stream (e2e)', () => {
       .get(`/videos/${randomUUID()}/stream`)
       .expect(404);
 
-    expect(res.body.error).toBe('VIDEO_NOT_FOUND');
+    expect((res.body as { error: string }).error).toBe('VIDEO_NOT_FOUND');
   });
 
   it('video-not-ready: returns 409 with VIDEO_NOT_READY', async () => {
@@ -141,7 +141,7 @@ describe('GET /videos/:id/stream (e2e)', () => {
       .get(`/videos/${processingVideoId}/stream`)
       .expect(409);
 
-    expect(res.body.error).toBe('VIDEO_NOT_READY');
+    expect((res.body as { error: string }).error).toBe('VIDEO_NOT_READY');
   });
 
   it('anonymous-access-allowed: succeeds without an Authorization header', async () => {

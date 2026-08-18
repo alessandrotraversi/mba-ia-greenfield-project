@@ -34,6 +34,10 @@ docker compose exec nestjs-api npm run start:dev
 Services:
 - `nestjs-api` — NestJS API, port `3000`
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
+- `mailpit` — SMTP capture for local dev, port `1025` (SMTP) / `8025` (web UI)
+- `redis` — Bull queue backend + upload-notification transport, port `6379`
+- `minio` — S3-compatible object storage, port `9000` (API) / `9001` (console), bucket `streamtube-videos`
+- `worker` — video processing worker (`Dockerfile.worker`, Node 22 + FFmpeg), no exposed port, no HTTP server — see "Video Module (Phase 03)" below
 
 All verification and teardown commands run on the **host machine**:
 
@@ -154,7 +158,36 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 - **TypeScript:** `nodenext` module resolution, `ES2023` target, `strictNullChecks` on, `noImplicitAny` off
 - **Decorators:** `emitDecoratorMetadata` + `experimentalDecorators` enabled — required for NestJS DI
 - **Prettier:** single quotes, trailing commas everywhere
-- **ESLint:** `no-explicit-any` allowed; `no-floating-promises` and `no-unsafe-argument` are warnings
+- **ESLint:** `no-explicit-any` allowed; `no-floating-promises` and `no-unsafe-argument` are warnings; `@typescript-eslint/unbound-method` is off in `*.spec.ts` / `*.integration-spec.ts` / `*.e2e-spec.ts` (see `eslint.config.mjs` for why — `jest.Mocked<T>` assertions like `expect(mockedService.method).toHaveBeenCalledWith(...)` are a known false positive for that rule)
+
+## Video Module (Phase 03)
+
+Adds video upload, background processing, and streaming on top of the Phase 01/02 foundation. Planning artifacts: `docs/decisions/technical-decisions-phase-03-videos.md` and `docs/phases/phase-03-videos/`.
+
+**New modules/files:**
+
+- `src/videos/` — API-side `VideosModule`: `VideosController`, `VideosService`, `Video` entity, `UploadNotificationListener`, DTOs (`create-upload-session.dto.ts`), domain exceptions (`video.exception.ts`).
+- `src/videos/video-processing.module.ts` — `VideoProcessingModule`, **worker-only**: registers `VideoProcessorService` as a Bull consumer. Not imported by `AppModule` — only `WorkerModule` imports it, because it depends on the `ffmpeg`/`ffprobe` binaries, which exist only in the `worker` image.
+- `src/storage/storage.module.ts` — `StorageModule`, exports a MinIO `Client` under the `MINIO_CLIENT` token. On startup (`OnModuleInit`) it ensures the video bucket exists and configures a MinIO bucket notification (`s3:ObjectCreated:Put`) that publishes to a Redis list.
+- `src/worker.module.ts` / `src/worker.main.ts` — a separate NestJS application context (`NestFactory.createApplicationContext`, no HTTP server), bootstrapped by the `worker` Compose service (`npm run start:worker`). Wires `UsersModule` + `VideosModule` + `VideoProcessingModule` against the same Postgres/Redis/MinIO instances as the API.
+- `src/config/storage.config.ts`, `src/config/queue.config.ts` — namespaced `registerAs` factories for MinIO and Redis, following the Phase 01 config convention.
+
+**Endpoints** (`VideosController`, `@Controller('videos')`):
+
+- `POST /videos/upload-session` — authenticated. Validates size (≤10GB → `FILE_TOO_LARGE`) and content type (`video/*` → `UNSUPPORTED_CONTENT_TYPE`), creates a `draft` `Video` row scoped to the caller's channel, and returns a MinIO presigned PUT URL (`videoId`, `uploadUrl`, `expiresAt`, `storageKey`).
+- `GET /videos/:id/stream` — public (`@Public()`). Streams a `ready` video from MinIO; honors the `Range` header (`206`, seek/playback) or serves the full byte stream (`200`) when absent — the same route serves both playback and full download, there is no separate download endpoint. Errors: `404` `VIDEO_NOT_FOUND`, `409` `VIDEO_NOT_READY`, `416` `RANGE_NOT_SATISFIABLE`.
+
+**Upload → processing pipeline:**
+
+1. `POST /videos/upload-session` creates the `Video` row with `status: draft`.
+2. The client `PUT`s the file directly to MinIO with the presigned URL — the file never passes through the API.
+3. MinIO's bucket notification publishes the `s3:ObjectCreated:Put` event to the Redis list `video-upload-events` (`MINIO_NOTIFY_REDIS_*` env vars on the `minio` Compose service).
+4. `UploadNotificationListener` (`BLPOP` loop against that list; runs in both `nestjs-api` and `worker` — harmless, `BLPOP` pops atomically so only one process handles each entry) parses the event, extracts the video id from the object key, and calls `VideosService.markProcessing`, which flips the row to `processing` and enqueues a `process-video` job on the `video-processing` Bull queue.
+5. `VideoProcessorService` (worker only, `@Processor(VIDEO_PROCESSING_QUEUE)`) consumes the job: downloads the object from MinIO to a temp file, runs `ffprobe` (duration) and `ffmpeg` (thumbnail frame) via `execa`, uploads the thumbnail back to MinIO, and marks the video `ready`. On failure, `status` becomes `error` with `last_error` and `processing_attempts` populated — **no automatic or manual retry ships in this phase**; a new upload session (new `Video` row) is the only way to retry.
+
+**Data model** (`videos` table, `src/videos/entities/video.entity.ts`): `id` (UUID PK), `channel_id` (FK → `channels`), `status` (enum `draft`/`processing`/`ready`/`error`), `storage_key`, `thumbnail_key` (nullable), `duration_seconds` (nullable), `file_size_bytes` (nullable), `processing_attempts` (default 0), `last_error` (nullable), timestamps. Migration: `src/database/migrations/1786998153182-CreateVideos.ts`.
+
+**New env vars:** `REDIS_HOST`, `REDIS_PORT`, `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET`.
 
 ## REST Conventions
 
